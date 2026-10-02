@@ -1,0 +1,34 @@
+# Fly.io app config for the hosted O*NET MCP server.
+# Rename `app` to something globally unique before `fly launch` (e.g. vetour-onet-mcp).
+
+app = "vetour-onet-mcp"
+primary_region = "ord"  # pick the region closest to you / your customers
+
+[build]
+
+[env]
+  PORT = "8000"
+
+[mounts]
+  source = "onet_data"
+  destination = "/data"
+
+[http_service]
+  internal_port = 8000
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 1
+  processes = ["app"]
+
+  [[http_service.checks]]
+    grace_period = "10s"
+    interval = "15s"
+    method = "GET"
+    timeout = "5s"
+    path = "/healthz"
+
+[[vm]]
+  memory = "512mb"
+  cpu_kind = "shared"
+  cpus = 1
