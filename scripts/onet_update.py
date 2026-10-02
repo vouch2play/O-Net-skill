@@ -19,11 +19,14 @@ from __future__ import annotations
 
 import argparse
 import re
+import shutil
 import subprocess
 import sys
 import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from urllib.parse import quote
+from zipfile import ZipFile
 
 import requests
 
@@ -38,49 +41,63 @@ RSS_URL = "https://www.onetcenter.org/rss/whatsnew.xml"
 DATABASE_PAGE_URL = "https://www.onetcenter.org/database.html"
 DOWNLOAD_BASE = "https://www.onetcenter.org/dl_files/database"
 
-# All 40 Excel files in the O*NET database release.
+# Current O*NET Excel files (31.0+). Used if the zip download is unavailable.
+# 30.3 renamed/split several files and dropped Tools Used, Work Values, and
+# UNSPSC Reference. See https://www.onetcenter.org/dictionary/current/excel/
 DATABASE_FILES = [
     "Abilities to Work Activities.xlsx",
     "Abilities to Work Context.xlsx",
     "Abilities.xlsx",
-    "Alternate Titles.xlsx",
-    "Basic Interests to RIASEC.xlsx",
+    "Career Interest Type Keywords.xlsx",
+    "Career Interest Types.xlsx",
     "Content Model Reference.xlsx",
-    "DWA Reference.xlsx",
-    "Education, Training, and Experience Categories.xlsx",
-    "Education, Training, and Experience.xlsx",
+    "Education Categories.xlsx",
+    "Education.xlsx",
     "Emerging Tasks.xlsx",
-    "IWA Reference.xlsx",
+    "Essential Skills to Work Activities.xlsx",
+    "Essential Skills to Work Context.xlsx",
+    "Essential Skills.xlsx",
+    "GWAs to IWAs to DWAs.xlsx",
+    "GWAs to IWAs.xlsx",
     "Interests Illustrative Activities.xlsx",
     "Interests Illustrative Occupations.xlsx",
-    "Interests.xlsx",
+    "Job Titles.xlsx",
     "Job Zone Reference.xlsx",
     "Job Zones.xlsx",
     "Knowledge.xlsx",
     "Level Scale Anchors.xlsx",
     "Occupation Data.xlsx",
     "Occupation Level Metadata.xlsx",
-    "RIASEC Keywords.xlsx",
     "Related Occupations.xlsx",
     "Sample of Reported Titles.xlsx",
     "Scales Reference.xlsx",
-    "Skills to Work Activities.xlsx",
-    "Skills to Work Context.xlsx",
-    "Skills.xlsx",
+    "Software Skills.xlsx",
+    "Specific Interest Areas to Career Interest Types.xlsx",
+    "Specific Interest Areas.xlsx",
     "Survey Booklet Locations.xlsx",
     "Task Categories.xlsx",
     "Task Ratings.xlsx",
     "Task Statements.xlsx",
     "Tasks to DWAs.xlsx",
-    "Technology Skills.xlsx",
-    "Tools Used.xlsx",
-    "UNSPSC Reference.xlsx",
+    "Training and Experience Categories.xlsx",
+    "Training and Experience.xlsx",
+    "Transferable Skills to Work Activities.xlsx",
+    "Transferable Skills to Work Context.xlsx",
+    "Transferable Skills.xlsx",
     "Work Activities.xlsx",
     "Work Context Categories.xlsx",
     "Work Context.xlsx",
+    "Work Styles to Work Activities.xlsx",
+    "Work Styles to Work Context.xlsx",
     "Work Styles.xlsx",
+]
+
+# Last published in 30.2; no longer included in current releases.
+LEGACY_FILES = [
+    "Tools Used.xlsx",
     "Work Values.xlsx",
 ]
+LEGACY_VERSION = "30.2"
 
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "onet-skill-updater/1.0"})
@@ -182,9 +199,21 @@ def detect_latest_version() -> str | None:
 def _download_url(version: str, filename: str) -> str:
     """Build the download URL for a specific file and version."""
     segment = _version_to_path_segment(version)
-    # URL-encode spaces as %20 for the filename
-    encoded = filename.replace(" ", "%20")
+    encoded = quote(filename)
     return f"{DOWNLOAD_BASE}/{segment}_excel/{encoded}"
+
+
+def _cleanup_temp_files() -> None:
+    for tmp in REFERENCES_DIR.glob("*.tmp"):
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
+def _atomic_replace(tmp: Path, dest: Path) -> None:
+    """Replace dest with tmp. os.replace overwrites on Windows; Path.rename does not."""
+    tmp.replace(dest)
 
 
 def download_file(version: str, filename: str) -> bool:
@@ -199,48 +228,152 @@ def download_file(version: str, filename: str) -> bool:
         print(f"  FAILED: {filename} ({exc})", file=sys.stderr)
         return False
 
-    # Write to a temp file first, then rename for atomicity.
     tmp = dest.with_suffix(".tmp")
     try:
         with open(tmp, "wb") as f:
             for chunk in resp.iter_content(chunk_size=65536):
                 f.write(chunk)
-        tmp.rename(dest)
+        _atomic_replace(tmp, dest)
         return True
     except OSError as exc:
         print(f"  FAILED to write {filename}: {exc}", file=sys.stderr)
         if tmp.exists():
-            tmp.unlink()
+            tmp.unlink(missing_ok=True)
         return False
+
+
+def _is_appendix(filename: str) -> bool:
+    return filename.lower().startswith("appendix")
+
+
+def download_excel_zip(version: str) -> tuple[list[str], list[str]] | None:
+    """Download the Excel zip for a version and extract database xlsx files.
+
+    Returns (extracted, failed) filenames, or None if the zip is unavailable.
+    """
+    segment = _version_to_path_segment(version)
+    url = f"{DOWNLOAD_BASE}/{segment}_excel.zip"
+    zip_tmp = REFERENCES_DIR / f"{segment}_excel.zip.tmp"
+
+    print(f"  Downloading {segment}_excel.zip...", end="", flush=True)
+    try:
+        resp = SESSION.get(url, timeout=180, stream=True)
+        resp.raise_for_status()
+        with open(zip_tmp, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=262144):
+                f.write(chunk)
+    except requests.RequestException as exc:
+        print(f" FAILED ({exc})", file=sys.stderr)
+        if zip_tmp.exists():
+            zip_tmp.unlink(missing_ok=True)
+        return None
+
+    extracted: list[str] = []
+    failed: list[str] = []
+    try:
+        with ZipFile(zip_tmp) as zf:
+            members = [
+                info
+                for info in zf.infolist()
+                if Path(info.filename).name.lower().endswith(".xlsx")
+                and not _is_appendix(Path(info.filename).name)
+            ]
+            total = len(members)
+            print(f" OK ({total} Excel files)")
+            for i, info in enumerate(members, 1):
+                name = Path(info.filename).name
+                pct = i * 100 // total if total else 100
+                print(f"  [{pct:3d}%] Extracting {name}...", end="", flush=True)
+                dest = REFERENCES_DIR / name
+                tmp = dest.with_suffix(".tmp")
+                try:
+                    with zf.open(info) as src, open(tmp, "wb") as out:
+                        shutil.copyfileobj(src, out)
+                    _atomic_replace(tmp, dest)
+                    print(" OK")
+                    extracted.append(name)
+                except OSError as exc:
+                    print(f" FAILED ({exc})", file=sys.stderr)
+                    if tmp.exists():
+                        tmp.unlink(missing_ok=True)
+                    if dest.exists() and dest.stat().st_size > 0:
+                        print(f"    keeping existing {name}")
+                        extracted.append(name)
+                    else:
+                        failed.append(name)
+        return extracted, failed
+    except Exception as exc:
+        print(f" FAILED to extract ({exc})", file=sys.stderr)
+        return None
+    finally:
+        if zip_tmp.exists():
+            zip_tmp.unlink(missing_ok=True)
+
+
+def download_excel_files(version: str, filenames: list[str]) -> tuple[list[str], list[str]]:
+    """Download individual Excel files. Returns (succeeded, failed)."""
+    succeeded: list[str] = []
+    failed: list[str] = []
+    total = len(filenames)
+    for i, filename in enumerate(filenames, 1):
+        pct = i * 100 // total
+        print(f"  [{pct:3d}%] Downloading {filename}...", end="", flush=True)
+        if download_file(version, filename):
+            print(" OK")
+            succeeded.append(filename)
+        else:
+            print(" FAILED")
+            failed.append(filename)
+        if i < total:
+            time.sleep(0.2)
+    return succeeded, failed
 
 
 def download_all(version: str) -> tuple[int, int]:
     """Download all database files for a given version.
 
+    Prefers the official Excel zip (always matches the current file names),
+    then falls back to per-file downloads. Also pulls last-published copies of
+    files that O*NET dropped after 30.2.
+
     Returns (success_count, failure_count).
     """
     REFERENCES_DIR.mkdir(parents=True, exist_ok=True)
+    _cleanup_temp_files()
 
-    total = len(DATABASE_FILES)
-    success = 0
-    failed = 0
+    zip_result = download_excel_zip(version)
+    if zip_result is None:
+        print("  Zip download unavailable; falling back to individual files.")
+        extracted, failed = download_excel_files(version, DATABASE_FILES)
+    else:
+        extracted, failed = zip_result
 
-    for i, filename in enumerate(DATABASE_FILES, 1):
-        pct = i * 100 // total
-        print(f"  [{pct:3d}%] Downloading {filename}...", end="", flush=True)
+    keep = set(extracted)
 
-        if download_file(version, filename):
+    print("\nDownloading optional legacy files last published in 30.2...")
+    for filename in LEGACY_FILES:
+        dest = REFERENCES_DIR / filename
+        print(f"  Downloading {filename} (from {LEGACY_VERSION})...", end="", flush=True)
+        if download_file(LEGACY_VERSION, filename):
             print(" OK")
-            success += 1
+            keep.add(filename)
+        elif dest.exists() and dest.stat().st_size > 0:
+            print(" FAILED; keeping existing copy")
+            keep.add(filename)
         else:
-            print(" FAILED")
-            failed += 1
+            print(" FAILED (optional, continuing)")
 
-        # Be polite to the server.
-        if i < total:
-            time.sleep(0.2)
+    for path in REFERENCES_DIR.glob("*.xlsx"):
+        if path.name not in keep:
+            print(f"  Removing obsolete file: {path.name}")
+            path.unlink()
 
-    return success, failed
+    required = REFERENCES_DIR / "Occupation Data.xlsx"
+    if not required.exists():
+        print("  Error: Occupation Data.xlsx is missing after download.", file=sys.stderr)
+        return len(keep), max(len(failed), 1)
+
+    return len(keep), len(failed)
 
 
 # ---------------------------------------------------------------------------
@@ -357,7 +490,7 @@ def main() -> None:
         sys.exit(0)
 
     # --- Download ---
-    print(f"\nDownloading O*NET {latest} database ({len(DATABASE_FILES)} files)...")
+    print(f"\nDownloading O*NET {latest} database...")
     print()
 
     success, failed = download_all(latest)

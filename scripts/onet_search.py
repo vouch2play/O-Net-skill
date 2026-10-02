@@ -60,6 +60,25 @@ def _connect() -> sqlite3.Connection:
     return conn
 
 
+def _existing_tables(conn: sqlite3.Connection) -> set[str]:
+    rows = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'"
+    ).fetchall()
+    return {r[0] for r in rows}
+
+
+def _pick_table(conn: sqlite3.Connection, *names: str) -> str | None:
+    tables = _existing_tables(conn)
+    for name in names:
+        if name in tables:
+            return name
+    return None
+
+
+def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {r[1] for r in conn.execute(f'PRAGMA table_info("{table}")')}
+
+
 def _rows_to_dicts(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
     return [dict(r) for r in rows]
 
@@ -112,32 +131,33 @@ def _search_occupations(conn: sqlite3.Connection, keyword: str) -> list[dict[str
                 "Description": r["description"],
             })
 
-    # Secondary: FTS5 match on alternate_titles for broader coverage
-    alt_rows = conn.execute(
-        """
-        SELECT DISTINCT o_net_soc_code
-        FROM alternate_titles_fts
-        WHERE alternate_titles_fts MATCH ?
-        ORDER BY rank
-        LIMIT 50
-        """,
-        (fts_query,),
-    ).fetchall()
+    # Secondary: FTS5 match on job/alternate titles for broader coverage
+    if "alternate_titles_fts" in _existing_tables(conn):
+        alt_rows = conn.execute(
+            """
+            SELECT DISTINCT o_net_soc_code
+            FROM alternate_titles_fts
+            WHERE alternate_titles_fts MATCH ?
+            ORDER BY rank
+            LIMIT 50
+            """,
+            (fts_query,),
+        ).fetchall()
 
-    for r in alt_rows:
-        code = r["o_net_soc_code"]
-        if code not in seen_codes:
-            seen_codes.add(code)
-            occ = conn.execute(
-                "SELECT * FROM occupation_data WHERE o_net_soc_code = ?",
-                (code,),
-            ).fetchone()
-            if occ:
-                results.append({
-                    "O*NET-SOC Code": occ["o_net_soc_code"],
-                    "Title": occ["title"],
-                    "Description": occ["description"],
-                })
+        for r in alt_rows:
+            code = r["o_net_soc_code"]
+            if code not in seen_codes:
+                seen_codes.add(code)
+                occ = conn.execute(
+                    "SELECT * FROM occupation_data WHERE o_net_soc_code = ?",
+                    (code,),
+                ).fetchone()
+                if occ:
+                    results.append({
+                        "O*NET-SOC Code": occ["o_net_soc_code"],
+                        "Title": occ["title"],
+                        "Description": occ["description"],
+                    })
 
     # Fallback: LIKE search if FTS5 returns nothing (handles partial codes, etc.)
     if not results:
@@ -197,7 +217,9 @@ def _top_rated(
 
 
 def _has_rated_data(conn: sqlite3.Connection, code: str) -> bool:
-    for table in ("skills", "knowledge", "abilities"):
+    for table in ("skills", "essential_skills", "transferable_skills", "knowledge", "abilities"):
+        if _pick_table(conn, table) is None:
+            continue
         row = conn.execute(
             f'SELECT 1 FROM "{table}" WHERE o_net_soc_code = ? LIMIT 1',
             (code,),
@@ -221,9 +243,11 @@ def _find_child_codes(conn: sqlite3.Connection, code: str) -> list[dict[str, str
 
 
 def _get_emerging_tasks(conn: sqlite3.Connection, code: str) -> list[dict[str, Any]]:
+    if _pick_table(conn, "emerging_tasks") is None:
+        return []
     rows = conn.execute(
         """
-        SELECT task, category, original_task_id, original_task, date, domain_source
+        SELECT *
         FROM emerging_tasks
         WHERE o_net_soc_code = ?
         ORDER BY date DESC
@@ -234,10 +258,13 @@ def _get_emerging_tasks(conn: sqlite3.Connection, code: str) -> list[dict[str, A
 
 
 def _get_interests(conn: sqlite3.Connection, code: str) -> list[dict[str, Any]]:
+    table = _pick_table(conn, "career_interest_types", "interests")
+    if table is None:
+        return []
     rows = conn.execute(
-        """
+        f"""
         SELECT element_id, element_name, scale_name, data_value, date, domain_source
-        FROM interests
+        FROM "{table}"
         WHERE o_net_soc_code = ?
         ORDER BY CAST(data_value AS REAL) DESC
         """,
@@ -247,6 +274,8 @@ def _get_interests(conn: sqlite3.Connection, code: str) -> list[dict[str, Any]]:
 
 
 def _get_tools_used(conn: sqlite3.Connection, code: str) -> list[dict[str, Any]]:
+    if _pick_table(conn, "tools_used") is None:
+        return []
     rows = conn.execute(
         """
         SELECT example, commodity_title
@@ -307,7 +336,20 @@ def gather_occupation_data(
         result["knowledge"] = _top_rated(conn, "knowledge", code)
 
     if include_all or "skills" in sections:
-        result["skills"] = _top_rated(conn, "skills", code)
+        skill_items: list[dict[str, Any]] = []
+        seen_elements: set[str] = set()
+        for table in ("skills", "essential_skills", "transferable_skills"):
+            if _pick_table(conn, table) is None:
+                continue
+            for item in _top_rated(conn, table, code):
+                key = str(item.get("element_id") or item.get("element_name") or "")
+                if key and key in seen_elements:
+                    continue
+                if key:
+                    seen_elements.add(key)
+                skill_items.append(item)
+        skill_items.sort(key=lambda r: float(r.get("data_value") or 0), reverse=True)
+        result["skills"] = skill_items[:15]
 
     if include_all or "abilities" in sections:
         result["abilities"] = _top_rated(conn, "abilities", code)
@@ -316,17 +358,21 @@ def gather_occupation_data(
         result["work_activities"] = _top_rated(conn, "work_activities", code)
 
     if include_all or "technology" in sections:
-        rows = conn.execute(
-            """
-            SELECT * FROM technology_skills
-            WHERE o_net_soc_code = ?
-            ORDER BY
-                CASE WHEN hot_technology = 'Y' THEN 0 ELSE 1 END,
-                example
-            """,
-            (code,),
-        ).fetchall()
-        result["technology_skills"] = _rows_to_dicts(rows)
+        table = _pick_table(conn, "software_skills", "technology_skills")
+        if table:
+            cols = _table_columns(conn, table)
+            example_col = "workplace_example" if "workplace_example" in cols else "example"
+            rows = conn.execute(
+                f"""
+                SELECT * FROM "{table}"
+                WHERE o_net_soc_code = ?
+                ORDER BY
+                    CASE WHEN hot_technology = 'Y' THEN 0 ELSE 1 END,
+                    "{example_col}"
+                """,
+                (code,),
+            ).fetchall()
+            result["technology_skills"] = _rows_to_dicts(rows)
 
     if include_all or "tasks" in sections:
         rows = conn.execute(
@@ -342,15 +388,34 @@ def gather_occupation_data(
         result["tasks"] = _rows_to_dicts(rows)
 
     if include_all or "education" in sections:
-        rows = conn.execute(
-            "SELECT * FROM education_training_and_experience WHERE o_net_soc_code = ?",
-            (code,),
-        ).fetchall()
-        cats = conn.execute(
-            "SELECT * FROM education_training_and_experience_categories"
-        ).fetchall()
-        result["education"] = _rows_to_dicts(rows)
-        result["education_categories"] = _rows_to_dicts(cats)
+        edu_rows: list[dict[str, Any]] = []
+        for table in (
+            "education_training_and_experience",
+            "education",
+            "training_and_experience",
+        ):
+            if _pick_table(conn, table) is None:
+                continue
+            edu_rows.extend(
+                _rows_to_dicts(
+                    conn.execute(
+                        f'SELECT * FROM "{table}" WHERE o_net_soc_code = ?',
+                        (code,),
+                    ).fetchall()
+                )
+            )
+        result["education"] = edu_rows
+
+        cats: list[dict[str, Any]] = []
+        for table in (
+            "education_training_and_experience_categories",
+            "education_categories",
+            "training_and_experience_categories",
+        ):
+            if _pick_table(conn, table) is None:
+                continue
+            cats.extend(_rows_to_dicts(conn.execute(f'SELECT * FROM "{table}"').fetchall()))
+        result["education_categories"] = cats
 
     if include_all or "styles" in sections:
         rows = conn.execute(
@@ -364,15 +429,16 @@ def gather_occupation_data(
         result["work_styles"] = _rows_to_dicts(rows)
 
     if include_all or "values" in sections:
-        rows = conn.execute(
-            """
-            SELECT * FROM work_values
-            WHERE o_net_soc_code = ? AND scale_id = 'EX'
-            ORDER BY CAST(data_value AS REAL) DESC
-            """,
-            (code,),
-        ).fetchall()
-        result["work_values"] = _rows_to_dicts(rows)
+        if _pick_table(conn, "work_values"):
+            rows = conn.execute(
+                """
+                SELECT * FROM work_values
+                WHERE o_net_soc_code = ? AND scale_id = 'EX'
+                ORDER BY CAST(data_value AS REAL) DESC
+                """,
+                (code,),
+            ).fetchall()
+            result["work_values"] = _rows_to_dicts(rows)
 
     if include_all or "context" in sections:
         rows = conn.execute(
@@ -406,11 +472,13 @@ def gather_occupation_data(
         result["related_occupations"] = _rows_to_dicts(rows)
 
     if include_all or "titles" in sections:
-        rows = conn.execute(
-            "SELECT * FROM alternate_titles WHERE o_net_soc_code = ?",
-            (code,),
-        ).fetchall()
-        result["alternate_titles"] = _rows_to_dicts(rows)
+        table = _pick_table(conn, "job_titles", "alternate_titles")
+        if table:
+            rows = conn.execute(
+                f'SELECT * FROM "{table}" WHERE o_net_soc_code = ?',
+                (code,),
+            ).fetchall()
+            result["alternate_titles"] = _rows_to_dicts(rows)
 
     if include_all or "emerging_tasks" in sections:
         result["emerging_tasks"] = _get_emerging_tasks(conn, code)
@@ -489,8 +557,8 @@ def format_markdown(data: dict[str, Any]) -> str:
         lines.append("| Technology | Category | Hot | In Demand |")
         lines.append("|-----------|----------|-----|-----------|")
         for item in tech:
-            example = item.get("example", "")
-            commodity = item.get("commodity_title", "")
+            example = item.get("example") or item.get("workplace_example") or ""
+            commodity = item.get("commodity_title") or item.get("element_name") or ""
             hot = "Y" if str(item.get("hot_technology", "")).strip() == "Y" else ""
             demand = "Y" if str(item.get("in_demand", "")).strip() == "Y" else ""
             lines.append(f"| {example} | {commodity} | {hot} | {demand} |")
@@ -593,7 +661,7 @@ def format_markdown(data: dict[str, Any]) -> str:
         lines.append("## Alternate Titles")
         lines.append("")
         for item in alt:
-            t = item.get("alternate_title", "")
+            t = item.get("alternate_title") or item.get("job_title") or ""
             if t:
                 lines.append(f"- {t}")
         lines.append("")

@@ -159,9 +159,7 @@ def build_database(references_dir: Path | None = None, db_path: Path | None = No
     conn.execute("VACUUM")
     conn.close()
 
-    if db.exists():
-        db.unlink()
-    tmp_db.rename(db)
+    tmp_db.replace(db)
 
     return db
 
@@ -205,6 +203,18 @@ def _create_indices(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+        (name,),
+    ).fetchone()
+    return row is not None
+
+
+def _column_names(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {row[1] for row in conn.execute(f'PRAGMA table_info("{table}")')}
+
+
 def _create_fts_index(conn: sqlite3.Connection) -> None:
     conn.execute("DROP TABLE IF EXISTS occupation_fts")
     conn.execute("""
@@ -222,22 +232,40 @@ def _create_fts_index(conn: sqlite3.Connection) -> None:
         SELECT rowid, o_net_soc_code, title, description FROM occupation_data
     """)
 
-    # Also index alternate titles for broader search coverage
+    # 30.3 renamed Alternate Titles.xlsx -> Job Titles.xlsx and
+    # "Alternate Title" -> "Job Title". Keep a stable FTS table name for search.
+    titles_table = next(
+        (name for name in ("job_titles", "alternate_titles") if _table_exists(conn, name)),
+        None,
+    )
     conn.execute("DROP TABLE IF EXISTS alternate_titles_fts")
-    conn.execute("""
-        CREATE VIRTUAL TABLE alternate_titles_fts USING fts5(
-            o_net_soc_code,
-            title,
-            alternate_title,
-            content='alternate_titles',
-            content_rowid='rowid',
-            tokenize='porter unicode61'
-        )
-    """)
-    conn.execute("""
-        INSERT INTO alternate_titles_fts(rowid, o_net_soc_code, title, alternate_title)
-        SELECT rowid, o_net_soc_code, title, alternate_title FROM alternate_titles
-    """)
+    if titles_table:
+        cols = _column_names(conn, titles_table)
+        title_col = "job_title" if "job_title" in cols else "alternate_title"
+        if title_col in cols:
+            conn.execute("""
+                CREATE VIRTUAL TABLE alternate_titles_fts USING fts5(
+                    o_net_soc_code,
+                    title,
+                    alternate_title,
+                    tokenize='porter unicode61'
+                )
+            """)
+            conn.execute(
+                f"""
+                INSERT INTO alternate_titles_fts(o_net_soc_code, title, alternate_title)
+                SELECT o_net_soc_code, title, "{title_col}" FROM "{titles_table}"
+                """
+            )
+        else:
+            print(
+                f"  Warning: {titles_table} has no job/alternate title column; "
+                "skipping titles FTS",
+                file=sys.stderr,
+            )
+    else:
+        print("  Warning: no job/alternate titles table; skipping titles FTS", file=sys.stderr)
+
     conn.commit()
 
 
